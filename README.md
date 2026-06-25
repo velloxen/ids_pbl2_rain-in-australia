@@ -9,3 +9,9 @@ This is a group project by
 * Kurokawa, Akane
 
 The main [Jupyter Notebook](https://jupyter.org/) is `main.ipynb`. Liau wrote the `enrich_weather.py` script used in [Enrich Dataset](main.ipynb#enrich-dataset).
+
+## Installation
+Pip installed packages are listed in the first cell of `main.ipynb`. Users of Visual Studio Code may need to *disable* `Http: Proxy Strict SSL` in settings.
+
+## TODO
+* Appropriately describe UNITS for the columns (e.g. Rainfall is in mm)
