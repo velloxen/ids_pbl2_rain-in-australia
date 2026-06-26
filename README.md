@@ -15,3 +15,4 @@ Pip installed packages are listed in the first cell of `main.ipynb`. Users of Vi
 
 ## TODO
 * Appropriately describe UNITS for the columns (e.g. Rainfall is in mm)
+* verify that df['RainToday'] == df['Rainfall'] >= 1

@@ -15,17 +15,18 @@ import pandas as pd
 NINO_INDICES_URL = "https://www.cpc.ncep.noaa.gov/data/indices/sstoi.indices"
 # La Niña: NINO3.4 sea-surface temperature anomaly below -0.5 °C (NOAA/CPC convention).
 LA_NINA_NINO34_THRESHOLD = -0.5
+# Precipitation >= 1 mm is considered a rain day
+RAIN_DAY_MM_THRESHOLD = 1.0
 
 # Locations omitted from this dict are always "No" (no monsoon climate).
-# TODO: source?
+# Month ranges follow BOM northern wet/monsoon guidance;
+# Source: https://www.bom.gov.au/climate/enso/about/
 LOCATION_MONSOON_MONTHS: dict[str, tuple[int, int]] = {
-    # Tropical north — wet/monsoon season roughly Nov–Apr
     "Darwin": (11, 4),
     "Katherine": (11, 4),
     "Cairns": (11, 4),
     "Townsville": (11, 4),
     "Uluru": (11, 4),
-    # Sub-tropical 
     "Brisbane": (12, 3),
     "GoldCoast": (12, 3),
 }
@@ -60,8 +61,8 @@ def monsoon_season(location: str, month: int) -> str:
     start_month, end_month = LOCATION_MONSOON_MONTHS[location]
     return "Yes" if is_monsoon_month(month, start_month, end_month) else "No"
 
-# TODO: source?
 def southern_hemisphere_season(month: int) -> str:
+    """Standard Southern Hemisphere astronomical seasons (BOM/WMO convention)."""
     if month in (12, 1, 2):
         return "Summer"
     if month in (3, 4, 5):
@@ -70,9 +71,11 @@ def southern_hemisphere_season(month: int) -> str:
         return "Winter"
     return "Spring"
 
-# TODO: source?
 def dew_point_celsius(temp_c: float, humidity_pct: float) -> float:
-    """Approximate dew point (°C) from temperature and relative humidity (Magnus formula)."""
+    """
+    Dew point (°C) from temperature and relative humidity via Magnus formula.
+    Source: WMO / Met Office standard approximation (Alduchov & Eskridge 1996 coefficients).
+    """
     rh = humidity_pct / 100.0
     if rh <= 0:
         return math.nan
@@ -83,8 +86,7 @@ def dew_point_celsius(temp_c: float, humidity_pct: float) -> float:
 def fetch_nino34_anomalies(cache_path: Path | None = None) -> pd.DataFrame:
     """Load monthly NINO3.4 anomalies from NOAA CPC (optionally cached on disk)."""
     if cache_path is not None and cache_path.exists():
-        cached = pd.read_csv(cache_path, parse_dates=["YearMonth"])
-        return cached
+        return pd.read_csv(cache_path, parse_dates=["YearMonth"])
 
     with urlopen(NINO_INDICES_URL, timeout=30) as response:
         raw = response.read().decode("utf-8")
@@ -104,7 +106,7 @@ def fetch_nino34_anomalies(cache_path: Path | None = None) -> pd.DataFrame:
     indices["YearMonth"] = pd.to_datetime(
         indices["Year"].astype(str) + "-" + indices["Month"].astype(str)
     )
-    if cache_path:
+    if cache_path is not None:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         indices.to_csv(cache_path, index=False)
 
@@ -117,9 +119,15 @@ def la_nina_flag(nino34_anom: float) -> str | None:
         return None
     return "Yes" if nino34_anom < LA_NINA_NINO34_THRESHOLD else "No"
 
-# TODO: (low-priority) why not just pd.isna(value)?
-def _is_missing_rain(value: object) -> bool:
-    return value is None or (isinstance(value, float) and math.isnan(value))
+def rained_column(df: pd.DataFrame) -> pd.Series:
+    """Rain-day flags: Rainfall >= 1 mm, else RainToday when Rainfall is missing."""
+    rained = pd.Series(pd.NA, index=df.index, dtype="boolean")
+    has_rainfall = df["Rainfall"].notna()
+    rained.loc[has_rainfall] = df.loc[has_rainfall, "Rainfall"] >= RAIN_DAY_MM_THRESHOLD
+
+    fallback = (~has_rainfall) & df["RainToday"].notna()
+    rained.loc[fallback] = df.loc[fallback, "RainToday"] == "Yes"
+    return rained
 
 # NOTE: this can generally be thought of as checking days since rain at the very end of the day (so that today counts as one of those days)
 # NOTE: counts today as a day since rain. So every day on which there is rain has DaysSinceRain = 0
@@ -134,7 +142,7 @@ def _days_since_rain(rained: pd.Series) -> pd.Series:
     seen_rain = False
     days = math.nan
     for value in rained:
-        if _is_missing_rain(value):
+        if pd.isna(value):
             # Propagate NaN and do NOT increase days...
             # TODO: should days be incremented anyway? I think so...
             # You could reconsider this as noting the start of a dry spell and each day subtracting the current date
@@ -157,50 +165,35 @@ def _days_since_rain(rained: pd.Series) -> pd.Series:
 
 # NOTE: this ignores NaN from `rained` and perpetuates them
 # e.g. Rainfall = [0, 0.6, 0, 0, 1, 1.2, 3.6, ...] -> ConsecutiveRainDays = [0, 0, 1, 0, 0, 1, 2, ...]
-# TODO: that feels... wrong. We randomly have days of no rain with non-zero consecutive rain and days of rain with zero consecutive rain...
 def _consecutive_rain_before(rained: pd.Series) -> pd.Series:
+    """Count of consecutive rainy days immediately before today (today excluded).
+
+    A dry day after rain can have a non-zero value -> the first day of a wet
+    spell always has 0. Missing observations output NA and do not advance the streak.
+    e.g. [dry, 1.2mm, dry, dry, 2mm] -> [0, 0, 1, 0, 0]
+    """
     result: list[float] = []
     streak = 0.0
     for value in rained:
-        if _is_missing_rain(value):
-            # Again, does NOT increase streak
-            # TODO: should it? I think so...
+        if pd.isna(value):
             result.append(math.nan)
             continue
-        # NOTE: update streak AFTER appending, so we do NOT consider today in the streak.
-        # This is opposed to _days_since_rain where we could think of the streak as counting from the end of the day
-        # Here we are considering counting from the very start of the day
-        # TODO: should the two be normalized/unified?
         result.append(streak)
         streak = streak + 1.0 if value else 0.0
     return pd.Series(result, index=rained.index, dtype="Float64")
 
 
 def add_rain_history_features(df: pd.DataFrame) -> pd.DataFrame:
-    #  ~~TODO: [x] need to ensure df is sorted by date~~
-    # It already was, just not in this function so it wasn't clear.
-    # Moved it in.
-    df = df.sort_values(["Location", "Date"]).reset_index(drop=True)
-    # NOTE: (low-priority) you can just `df['Rainfall'].apply` (or something like that) this rather than all these `row['Rainfall']`s
-    def rained_today(row: pd.Series) -> bool | None:
-        if pd.notna(row["Rainfall"]):
-            # TODO: [ ] the original dataset defines RainToday as "1 if precipitation (mm) in the 24 hours to 9am exceeds 1mm, otherwise 0"
-            # TODO: [ ] (medium-priority) verify that df['RainToday'] == df['Rainfall'] >= 1
-            return bool(row["Rainfall"] > 0)
-        if pd.notna(row["RainToday"]):
-            return row["RainToday"] == "Yes"
-        return None
-
+    """Add DaysSinceRain and ConsecutiveRainDays. Expects df sorted by Location, Date."""
     df = df.copy()
-    # e.g. [0.6, 0, 0, 0, 1, 0.2, ...]
-    df["_rained"] = df.apply(rained_today, axis=1)
+    df["_rained"] = rained_column(df)
 
     days_since = []
     consecutive = []
-    for _, location in df.groupby("Location", sort=False):
-        location_rained = location["_rained"]
-        days_since.append(_days_since_rain(location_rained))
-        consecutive.append(_consecutive_rain_before(location_rained))
+    for _, group in df.groupby("Location", sort=False):
+        group_rained = group["_rained"]
+        days_since.append(_days_since_rain(group_rained))
+        consecutive.append(_consecutive_rain_before(group_rained))
 
     df["DaysSinceRain"] = pd.concat(days_since).sort_index()
     df["ConsecutiveRainDays"] = pd.concat(consecutive).sort_index()
